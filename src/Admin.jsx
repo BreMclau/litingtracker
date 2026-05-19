@@ -121,33 +121,35 @@ function Admin({ currentUserId, onBack }) {
         ) : profiles.length === 0 ? (
           <p className="muted">No team members yet.</p>
         ) : (
-          <table className="team-table">
-            <thead>
-              <tr>
-                <th>Email</th>
-                <th>Joined</th>
-                <th>Admin</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {profiles.map(p => (
-                <tr key={p.id}>
-                  <td>
-                    {p.email}
-                    {p.id === currentUserId && <span className="you-badge">you</span>}
-                  </td>
-                  <td>{new Date(p.created_at).toLocaleDateString()}</td>
-                  <td>{p.is_admin ? 'Yes' : 'No'}</td>
-                  <td>
-                    <button className="btn btn-ghost btn-small" onClick={() => toggleAdmin(p)}>
-                      {p.is_admin ? 'Revoke admin' : 'Make admin'}
-                    </button>
-                  </td>
+          <div className="team-table-wrap">
+            <table className="team-table">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Joined</th>
+                  <th>Admin</th>
+                  <th></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {profiles.map(p => (
+                  <tr key={p.id}>
+                    <td>
+                      {p.email}
+                      {p.id === currentUserId && <span className="you-badge">you</span>}
+                    </td>
+                    <td>{new Date(p.created_at).toLocaleDateString()}</td>
+                    <td>{p.is_admin ? 'Yes' : 'No'}</td>
+                    <td>
+                      <button className="btn btn-ghost btn-small" onClick={() => toggleAdmin(p)}>
+                        {p.is_admin ? 'Revoke admin' : 'Make admin'}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </section>
     </div>

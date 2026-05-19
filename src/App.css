@@ -307,8 +307,7 @@ body {
   margin-bottom: 6px;
 }
 
-.field input[type="text"],
-.field input[type="date"],
+.field input,
 .field textarea,
 .field select {
   border: 1px solid var(--border);
@@ -319,6 +318,7 @@ body {
   color: var(--text);
   background: #fff;
   transition: border-color 0.15s ease;
+  width: 100%;
 }
 
 .field input:focus,
@@ -719,4 +719,135 @@ body {
   .invite-form { grid-template-columns: 1fr; }
   .admin-screen { padding: 24px 16px 40px; }
   .user-strip { flex-direction: column; align-items: flex-start; }
+}
+
+/* ============================================================
+   MOBILE RESPONSIVE — tablets and phones
+   ============================================================ */
+@media (max-width: 700px) {
+  /* Prevent iOS Safari from zooming when an input is focused.
+     Inputs must be at least 16px font-size. */
+  .field input,
+  .field textarea,
+  .field select {
+    font-size: 16px;
+    padding: 11px 12px;
+  }
+
+  /* Larger tap targets across the board (Apple HIG ~44pt) */
+  .btn {
+    padding: 12px 18px;
+    min-height: 44px;
+  }
+  .btn-small {
+    padding: 9px 14px;
+    font-size: 13px;
+    min-height: 40px;
+  }
+  .icon-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+  }
+
+  /* Header shrinks slightly */
+  .app-header { padding: 16px 16px; }
+  .brand-name { font-size: 16px; }
+  .brand-sub  { font-size: 12px; }
+
+  /* Header buttons: 2-column grid, Add primary on its own row */
+  .header-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+    gap: 8px;
+  }
+  .header-actions .btn {
+    width: 100%;
+    padding: 12px 10px;
+  }
+  .header-actions .btn-primary {
+    grid-column: 1 / -1;
+  }
+
+  /* Tabs scroll horizontally (you asked for this) */
+  .tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    margin-left: -16px;
+    margin-right: -16px;
+    padding: 0 16px 4px;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    flex: 0 0 auto;
+    padding: 12px 14px;
+    font-size: 13px;
+    min-height: 44px;
+  }
+
+  /* User strip — actions stretch across the row */
+  .user-strip { font-size: 13px; padding: 10px 12px; }
+  .user-actions { width: 100%; }
+  .user-actions .btn { flex: 1; }
+
+  /* Listing card */
+  .card-header {
+    padding: 12px 14px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .card-title {
+    white-space: normal;
+    line-height: 1.4;
+    flex: 1 1 100%;
+    font-size: 15px;
+  }
+  .card-controls {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+  .card-body { padding: 18px 14px; }
+  .card-meta { padding: 8px 14px; }
+
+  /* Subsections inside card */
+  .subsection { margin-top: 18px; padding-top: 14px; }
+
+  /* Auth screen */
+  .auth-screen { padding: 16px; }
+  .auth-card { padding: 32px 22px; }
+  .auth-brand-name { font-size: 15px; letter-spacing: 0.5px; }
+  .auth-title { font-size: 20px; }
+
+  /* Admin */
+  .admin-section { padding: 18px 16px; }
+  .admin-header { gap: 12px; flex-wrap: wrap; }
+  .admin-header h2 { font-size: 18px; }
+  .team-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -4px;
+  }
+  .team-table { min-width: 480px; }
+
+  /* Confirm modal — stack buttons full-width */
+  .confirm-modal { padding: 22px; }
+  .confirm-actions { flex-direction: column-reverse; }
+  .confirm-actions .btn { width: 100%; }
+}
+
+/* ============================================================
+   Very small phones (≤380px)
+   ============================================================ */
+@media (max-width: 380px) {
+  .app-header { padding: 14px 12px; }
+  .content { padding: 16px 12px 32px; }
+  .header-actions { grid-template-columns: 1fr; }
+  .header-actions .btn-primary { grid-column: 1; }
+  .tab { padding: 10px 12px; font-size: 12px; }
+  .brand-name { font-size: 14px; }
+  .auth-card { padding: 28px 18px; }
 }
