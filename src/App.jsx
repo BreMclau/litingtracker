@@ -1,16 +1,18 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { supabase } from './supabase'
+import Auth from './Auth'
+import Admin from './Admin'
 
 const STORAGE_KEY = 'legacy-listing-tracker-v1'
-
 const STATUSES = ['New', 'In Progress', 'Completed']
 const TABS = ['New', 'In Progress', 'Completed', 'All Active']
+const SAVE_DEBOUNCE_MS = 600
 
 const statusClass = (status) => {
   if (status === 'In Progress') return 'status-in-progress'
   if (status === 'Completed') return 'status-completed'
   return 'status-new'
 }
-
 const statusPillClass = (status) => status.replace(' ', '')
 
 const makeId = () => {
@@ -18,7 +20,7 @@ const makeId = () => {
   return 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9)
 }
 
-const emptyListing = () => ({
+const emptyListing = (overrides = {}) => ({
   id: makeId(),
   address: '',
   agent: '',
@@ -29,35 +31,165 @@ const emptyListing = () => ({
   status: 'New',
   photoDates: ['', '', ''],
   needs: ['', '', ''],
+  sortOrder: 0,
   collapsed: false,
   createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  createdBy: null,
+  ...overrides,
+})
+
+const rowToListing = (row) => ({
+  id: row.id,
+  address: row.property_address || '',
+  agent: row.listing_agent || '',
+  listingDate: row.listing_date || '',
+  notes: row.notes || '',
+  previousListing: !!row.previous_listing,
+  printedItems: !!row.printed_items,
+  status: row.status || 'New',
+  photoDates: [row.photo_date_1 || '', row.photo_date_2 || '', row.photo_date_3 || ''],
+  needs: [row.need_1 || '', row.need_2 || '', row.need_3 || ''],
+  sortOrder: row.sort_order ?? 0,
+  collapsed: false,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  createdBy: row.created_by,
+})
+
+const listingToRow = (l) => ({
+  id: l.id,
+  property_address: l.address || '',
+  listing_agent: l.agent || '',
+  listing_date: l.listingDate || null,
+  notes: l.notes || '',
+  previous_listing: !!l.previousListing,
+  printed_items: !!l.printedItems,
+  status: l.status || 'New',
+  photo_date_1: l.photoDates[0] || null,
+  photo_date_2: l.photoDates[1] || null,
+  photo_date_3: l.photoDates[2] || null,
+  need_1: l.needs[0] || '',
+  need_2: l.needs[1] || '',
+  need_3: l.needs[2] || '',
+  sort_order: l.sortOrder ?? 0,
 })
 
 function App() {
-  const [listings, setListings] = useState([])
-  const [activeTab, setActiveTab] = useState('New')
-  const [confirmDelete, setConfirmDelete] = useState(null)
-  const [loaded, setLoaded] = useState(false)
-  const fileInputRef = useRef(null)
+  const [session, setSession] = useState(null)
+  const [profile, setProfile] = useState(null)
+  const [authChecked, setAuthChecked] = useState(false)
 
   useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored)
-        if (Array.isArray(parsed)) setListings(parsed)
-      } catch (e) {
-        console.error('Failed to load saved listings', e)
-      }
-    }
-    setLoaded(true)
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session ?? null)
+      setAuthChecked(true)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => {
+      setSession(sess)
+    })
+    return () => listener.subscription.unsubscribe()
   }, [])
 
   useEffect(() => {
-    if (loaded) {
+    if (!session?.user) {
+      setProfile(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      const { data } = await supabase
+        .from('profiles')
+        .select('id, email, is_admin')
+        .eq('id', session.user.id)
+        .maybeSingle()
+      if (cancelled) return
+      if (data) {
+        setProfile(data)
+      } else {
+        // Profile row missing — try to create one (e.g. if trigger didn't fire)
+        const { data: inserted } = await supabase
+          .from('profiles')
+          .upsert({ id: session.user.id, email: session.user.email })
+          .select('id, email, is_admin')
+          .maybeSingle()
+        if (!cancelled) setProfile(inserted || { id: session.user.id, email: session.user.email, is_admin: false })
+      }
+    })()
+    return () => { cancelled = true }
+  }, [session])
+
+  if (!authChecked) {
+    return <div className="loading-screen">Loading…</div>
+  }
+  if (!session) {
+    return <Auth />
+  }
+  return <Tracker session={session} profile={profile} />
+}
+
+function Tracker({ session, profile }) {
+  const [listings, setListings] = useState([])
+  const [profiles, setProfiles] = useState({})
+  const [activeTab, setActiveTab] = useState('New')
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [view, setView] = useState('tracker') // 'tracker' | 'admin'
+  const [statusMsg, setStatusMsg] = useState(null)
+  const fileInputRef = useRef(null)
+  const saveTimers = useRef(new Map())
+  const listingsRef = useRef(listings)
+
+  useEffect(() => { listingsRef.current = listings }, [listings])
+
+  const loadProfilesMap = useCallback(async () => {
+    const { data } = await supabase.from('profiles').select('id, email')
+    if (data) {
+      const map = {}
+      for (const p of data) map[p.id] = p.email
+      setProfiles(map)
+    }
+  }, [])
+
+  const loadListings = useCallback(async () => {
+    setLoading(true)
+    const { data, error } = await supabase
+      .from('listings')
+      .select('*')
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: false })
+    if (error) {
+      // Fall back to localStorage
+      const cached = localStorage.getItem(STORAGE_KEY)
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached)
+          if (Array.isArray(parsed)) setListings(parsed)
+        } catch {}
+      }
+      setStatusMsg(`Couldn't reach Supabase: ${error.message}. Showing local cache.`)
+    } else {
+      const mapped = (data || []).map(rowToListing)
+      setListings(mapped)
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mapped))
+      setStatusMsg(null)
+    }
+    setLoading(false)
+  }, [])
+
+  useEffect(() => {
+    loadListings()
+    loadProfilesMap()
+    const onFocus = () => { loadListings(); loadProfilesMap() }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [loadListings, loadProfilesMap])
+
+  useEffect(() => {
+    if (listings.length > 0 || localStorage.getItem(STORAGE_KEY)) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(listings))
     }
-  }, [listings, loaded])
+  }, [listings])
 
   const counts = {
     'New': listings.filter(l => l.status === 'New').length,
@@ -70,8 +202,30 @@ function App() {
     ? listings.filter(l => l.status !== 'Completed')
     : listings.filter(l => l.status === activeTab)
 
+  const scheduleSave = (id) => {
+    if (saveTimers.current.has(id)) clearTimeout(saveTimers.current.get(id))
+    const timer = setTimeout(async () => {
+      saveTimers.current.delete(id)
+      const current = listingsRef.current.find(l => l.id === id)
+      if (!current) return
+      const { error } = await supabase
+        .from('listings')
+        .update(listingToRow(current))
+        .eq('id', id)
+      if (error) {
+        setStatusMsg(`Save failed: ${error.message}`)
+      } else {
+        setStatusMsg(null)
+      }
+    }, SAVE_DEBOUNCE_MS)
+    saveTimers.current.set(id, timer)
+  }
+
   const updateListing = (id, updates) => {
     setListings(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l))
+    // collapsed is UI-only, never persisted
+    const onlyCollapsed = Object.keys(updates).length === 1 && 'collapsed' in updates
+    if (!onlyCollapsed) scheduleSave(id)
   }
 
   const updatePhotoDate = (id, idx, value) => {
@@ -81,6 +235,7 @@ function App() {
       photoDates[idx] = value
       return { ...l, photoDates }
     }))
+    scheduleSave(id)
   }
 
   const updateNeed = (id, idx, value) => {
@@ -90,22 +245,44 @@ function App() {
       needs[idx] = value
       return { ...l, needs }
     }))
+    scheduleSave(id)
   }
 
-  const addListing = () => {
-    const fresh = emptyListing()
-    setListings(prev => [fresh, ...prev])
+  const addListing = async () => {
+    const minSort = listings.length > 0
+      ? Math.min(...listings.map(l => l.sortOrder ?? 0))
+      : 0
+    const fresh = emptyListing({
+      sortOrder: minSort - 1,
+      createdBy: session.user.id,
+    })
+    const row = { ...listingToRow(fresh), created_by: session.user.id }
+    const { data, error } = await supabase
+      .from('listings')
+      .insert(row)
+      .select('*')
+      .single()
+    if (error) {
+      setStatusMsg(`Could not create listing: ${error.message}`)
+      return
+    }
+    setListings(prev => [rowToListing(data), ...prev])
     setActiveTab('New')
   }
 
-  const deleteListing = (id) => {
-    setListings(prev => prev.filter(l => l.id !== id))
+  const deleteListing = async (id) => {
     setConfirmDelete(null)
+    const { error } = await supabase.from('listings').delete().eq('id', id)
+    if (error) {
+      setStatusMsg(`Delete failed: ${error.message}`)
+      return
+    }
+    setListings(prev => prev.filter(l => l.id !== id))
   }
 
   const exportData = () => {
     const payload = {
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       listings,
     }
@@ -120,15 +297,13 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
-  const triggerImport = () => {
-    if (fileInputRef.current) fileInputRef.current.click()
-  }
+  const triggerImport = () => { if (fileInputRef.current) fileInputRef.current.click() }
 
   const handleImport = (e) => {
     const file = e.target.files && e.target.files[0]
     if (!file) return
     const reader = new FileReader()
-    reader.onload = (evt) => {
+    reader.onload = async (evt) => {
       try {
         const data = JSON.parse(evt.target.result)
         const incoming = Array.isArray(data) ? data : data.listings
@@ -136,15 +311,25 @@ function App() {
           alert('That file does not look like a valid backup.')
           return
         }
-        if (!window.confirm(`Import ${incoming.length} listing(s)? This will replace your current data.`)) return
-        const normalized = incoming.map(item => ({
-          ...emptyListing(),
-          ...item,
-          id: item.id || makeId(),
-          photoDates: Array.isArray(item.photoDates) ? [...item.photoDates, '', '', ''].slice(0, 3) : ['', '', ''],
-          needs: Array.isArray(item.needs) ? [...item.needs, '', '', ''].slice(0, 3) : ['', '', ''],
-        }))
-        setListings(normalized)
+        if (!window.confirm(`Import ${incoming.length} listing(s) into Supabase? They will be added to (not replace) what's already there.`)) return
+
+        const rows = incoming.map((item, idx) => {
+          const normalized = {
+            ...emptyListing(),
+            ...item,
+            photoDates: Array.isArray(item.photoDates) ? [...item.photoDates, '', '', ''].slice(0, 3) : ['', '', ''],
+            needs: Array.isArray(item.needs) ? [...item.needs, '', '', ''].slice(0, 3) : ['', '', ''],
+            sortOrder: (item.sortOrder ?? 0) + idx + 1000,
+          }
+          return { ...listingToRow(normalized), id: makeId(), created_by: session.user.id }
+        })
+
+        const { error } = await supabase.from('listings').insert(rows)
+        if (error) {
+          alert('Import failed: ' + error.message)
+          return
+        }
+        await loadListings()
       } catch (err) {
         alert('Could not parse that file: ' + err.message)
       }
@@ -153,19 +338,49 @@ function App() {
     e.target.value = ''
   }
 
-  const moveListing = (id, direction) => {
-    setListings(prev => {
-      const activeIds = prev.filter(l => l.status !== 'Completed').map(l => l.id)
-      const activeIdx = activeIds.indexOf(id)
-      if (activeIdx === -1) return prev
-      const swapWith = activeIds[activeIdx + direction]
-      if (!swapWith) return prev
-      const posA = prev.findIndex(l => l.id === id)
-      const posB = prev.findIndex(l => l.id === swapWith)
-      const next = [...prev]
-      ;[next[posA], next[posB]] = [next[posB], next[posA]]
-      return next
-    })
+  const moveListing = async (id, direction) => {
+    const active = listings.filter(l => l.status !== 'Completed')
+    const idx = active.findIndex(l => l.id === id)
+    if (idx === -1) return
+    const swap = active[idx + direction]
+    if (!swap) return
+
+    const a = active[idx]
+    const b = swap
+    const aSort = a.sortOrder ?? 0
+    const bSort = b.sortOrder ?? 0
+
+    setListings(prev => prev.map(l => {
+      if (l.id === a.id) return { ...l, sortOrder: bSort }
+      if (l.id === b.id) return { ...l, sortOrder: aSort }
+      return l
+    }))
+
+    const [r1, r2] = await Promise.all([
+      supabase.from('listings').update({ sort_order: bSort }).eq('id', a.id),
+      supabase.from('listings').update({ sort_order: aSort }).eq('id', b.id),
+    ])
+    if (r1.error || r2.error) {
+      setStatusMsg('Reorder failed; refreshing.')
+      loadListings()
+    }
+  }
+
+  const signOut = async () => {
+    await supabase.auth.signOut()
+  }
+
+  const refresh = () => {
+    loadListings()
+    loadProfilesMap()
+  }
+
+  if (view === 'admin') {
+    return (
+      <div className="app">
+        <Admin currentUserId={session.user.id} onBack={() => setView('tracker')} />
+      </div>
+    )
   }
 
   return (
@@ -178,6 +393,7 @@ function App() {
           </div>
           <div className="header-actions">
             <button className="btn btn-primary" onClick={addListing}>+ Add New Listing</button>
+            <button className="btn btn-secondary" onClick={refresh}>Refresh</button>
             <button className="btn btn-secondary" onClick={exportData}>Export</button>
             <button className="btn btn-secondary" onClick={triggerImport}>Import</button>
             <input
@@ -187,6 +403,19 @@ function App() {
               onChange={handleImport}
               style={{ display: 'none' }}
             />
+          </div>
+        </div>
+
+        <div className="user-strip">
+          <span className="user-info">
+            Signed in as <strong>{profile?.email || session.user.email}</strong>
+            {profile?.is_admin && <span className="admin-badge">admin</span>}
+          </span>
+          <div className="user-actions">
+            {profile?.is_admin && (
+              <button className="btn btn-secondary btn-small" onClick={() => setView('admin')}>Team</button>
+            )}
+            <button className="btn btn-secondary btn-small" onClick={signOut}>Sign out</button>
           </div>
         </div>
 
@@ -205,7 +434,13 @@ function App() {
       </header>
 
       <main className="content">
-        {visibleListings.length === 0 ? (
+        {statusMsg && <div className="status-banner">{statusMsg}</div>}
+
+        {loading ? (
+          <div className="empty-state">
+            <h2>Loading listings…</h2>
+          </div>
+        ) : visibleListings.length === 0 ? (
           <div className="empty-state">
             <h2>No listings here yet</h2>
             <p>Click "Add New Listing" to get started.</p>
@@ -218,6 +453,7 @@ function App() {
               activeTab={activeTab}
               isFirst={idx === 0}
               isLast={idx === visibleListings.length - 1}
+              creatorEmail={profiles[listing.createdBy]}
               onUpdate={(updates) => updateListing(listing.id, updates)}
               onUpdatePhotoDate={(i, v) => updatePhotoDate(listing.id, i, v)}
               onUpdateNeed={(i, v) => updateNeed(listing.id, i, v)}
@@ -254,6 +490,7 @@ function ListingCard({
   activeTab,
   isFirst,
   isLast,
+  creatorEmail,
   onUpdate,
   onUpdatePhotoDate,
   onUpdateNeed,
@@ -263,6 +500,9 @@ function ListingCard({
 }) {
   const showReorder = activeTab === 'All Active'
   const collapsed = !!listing.collapsed
+  const createdLabel = listing.createdAt
+    ? new Date(listing.createdAt).toLocaleDateString()
+    : null
 
   return (
     <div className={`listing-card ${statusClass(listing.status)}`}>
@@ -277,18 +517,8 @@ function ListingCard({
         <div className="card-controls">
           {showReorder && (
             <>
-              <button
-                className="icon-btn"
-                title="Move up"
-                onClick={onMoveUp}
-                disabled={isFirst}
-              >↑</button>
-              <button
-                className="icon-btn"
-                title="Move down"
-                onClick={onMoveDown}
-                disabled={isLast}
-              >↓</button>
+              <button className="icon-btn" title="Move up" onClick={onMoveUp} disabled={isFirst}>↑</button>
+              <button className="icon-btn" title="Move down" onClick={onMoveDown} disabled={isLast}>↓</button>
             </>
           )}
           <button
@@ -296,131 +526,118 @@ function ListingCard({
             title={collapsed ? 'Expand' : 'Collapse'}
             onClick={() => onUpdate({ collapsed: !collapsed })}
           >{collapsed ? '▾' : '▴'}</button>
-          <button
-            className="icon-btn danger"
-            title="Delete"
-            onClick={onDelete}
-          >×</button>
+          <button className="icon-btn danger" title="Delete" onClick={onDelete}>×</button>
         </div>
       </div>
 
       {!collapsed && (
-        <div className="card-body">
-          <div className="field-grid">
-            <div className="field full">
-              <label>Property Address</label>
-              <input
-                type="text"
-                value={listing.address}
-                onChange={(e) => onUpdate({ address: e.target.value })}
-                placeholder="123 Main St, City, State"
-              />
+        <>
+          {(creatorEmail || createdLabel) && (
+            <div className="card-meta">
+              {creatorEmail && <>Added by <strong>{creatorEmail}</strong></>}
+              {creatorEmail && createdLabel && ' • '}
+              {createdLabel && <>{createdLabel}</>}
             </div>
+          )}
 
-            <div className="field">
-              <label>Listing Agent</label>
-              <input
-                type="text"
-                value={listing.agent}
-                onChange={(e) => onUpdate({ agent: e.target.value })}
-                placeholder="Agent name"
-              />
-            </div>
+          <div className="card-body">
+            <div className="field-grid">
+              <div className="field full">
+                <label>Property Address</label>
+                <input
+                  type="text"
+                  value={listing.address}
+                  onChange={(e) => onUpdate({ address: e.target.value })}
+                  placeholder="123 Main St, City, State"
+                />
+              </div>
 
-            <div className="field">
-              <label>Listing Date</label>
-              <input
-                type="date"
-                value={listing.listingDate}
-                onChange={(e) => onUpdate({ listingDate: e.target.value })}
-              />
-            </div>
+              <div className="field">
+                <label>Listing Agent</label>
+                <input
+                  type="text"
+                  value={listing.agent}
+                  onChange={(e) => onUpdate({ agent: e.target.value })}
+                  placeholder="Agent name"
+                />
+              </div>
 
-            <div className="field full">
-              <label>Notes</label>
-              <textarea
-                value={listing.notes}
-                onChange={(e) => onUpdate({ notes: e.target.value })}
-                placeholder="Anything important about this listing..."
-              />
-            </div>
+              <div className="field">
+                <label>Listing Date</label>
+                <input
+                  type="date"
+                  value={listing.listingDate}
+                  onChange={(e) => onUpdate({ listingDate: e.target.value })}
+                />
+              </div>
 
-            <div className="field">
-              <label>Previous Listing</label>
-              <div className="toggle-group">
-                <button
-                  type="button"
-                  className={`toggle-btn ${listing.previousListing ? 'active' : ''}`}
-                  onClick={() => onUpdate({ previousListing: true })}
-                >Yes</button>
-                <button
-                  type="button"
-                  className={`toggle-btn ${!listing.previousListing ? 'active' : ''}`}
-                  onClick={() => onUpdate({ previousListing: false })}
-                >No</button>
+              <div className="field full">
+                <label>Notes</label>
+                <textarea
+                  value={listing.notes}
+                  onChange={(e) => onUpdate({ notes: e.target.value })}
+                  placeholder="Anything important about this listing..."
+                />
+              </div>
+
+              <div className="field">
+                <label>Previous Listing</label>
+                <div className="toggle-group">
+                  <button type="button" className={`toggle-btn ${listing.previousListing ? 'active' : ''}`} onClick={() => onUpdate({ previousListing: true })}>Yes</button>
+                  <button type="button" className={`toggle-btn ${!listing.previousListing ? 'active' : ''}`} onClick={() => onUpdate({ previousListing: false })}>No</button>
+                </div>
+              </div>
+
+              <div className="field">
+                <label>Printed Items</label>
+                <div className="toggle-group">
+                  <button type="button" className={`toggle-btn ${listing.printedItems ? 'active' : ''}`} onClick={() => onUpdate({ printedItems: true })}>Yes</button>
+                  <button type="button" className={`toggle-btn ${!listing.printedItems ? 'active' : ''}`} onClick={() => onUpdate({ printedItems: false })}>No</button>
+                </div>
+              </div>
+
+              <div className="field full">
+                <label>Status</label>
+                <select value={listing.status} onChange={(e) => onUpdate({ status: e.target.value })}>
+                  {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
               </div>
             </div>
 
-            <div className="field">
-              <label>Printed Items</label>
-              <div className="toggle-group">
-                <button
-                  type="button"
-                  className={`toggle-btn ${listing.printedItems ? 'active' : ''}`}
-                  onClick={() => onUpdate({ printedItems: true })}
-                >Yes</button>
-                <button
-                  type="button"
-                  className={`toggle-btn ${!listing.printedItems ? 'active' : ''}`}
-                  onClick={() => onUpdate({ printedItems: false })}
-                >No</button>
+            <div className="subsection">
+              <div className="subsection-title">Photo Dates</div>
+              <div className="triple-grid">
+                {[0, 1, 2].map(i => (
+                  <div className="field" key={i}>
+                    <label>Photo Date {i + 1}</label>
+                    <input
+                      type="date"
+                      value={listing.photoDates[i] || ''}
+                      onChange={(e) => onUpdatePhotoDate(i, e.target.value)}
+                    />
+                  </div>
+                ))}
               </div>
             </div>
 
-            <div className="field full">
-              <label>Status</label>
-              <select
-                value={listing.status}
-                onChange={(e) => onUpdate({ status: e.target.value })}
-              >
-                {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
+            <div className="subsection">
+              <div className="subsection-title">Needs</div>
+              <div className="triple-grid">
+                {[0, 1, 2].map(i => (
+                  <div className="field" key={i}>
+                    <label>Need {i + 1}</label>
+                    <input
+                      type="text"
+                      value={listing.needs[i] || ''}
+                      onChange={(e) => onUpdateNeed(i, e.target.value)}
+                      placeholder={`Need ${i + 1}`}
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
-
-          <div className="subsection">
-            <div className="subsection-title">Photo Dates</div>
-            <div className="triple-grid">
-              {[0, 1, 2].map(i => (
-                <div className="field" key={i}>
-                  <label>Photo Date {i + 1}</label>
-                  <input
-                    type="date"
-                    value={listing.photoDates[i] || ''}
-                    onChange={(e) => onUpdatePhotoDate(i, e.target.value)}
-                  />
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="subsection">
-            <div className="subsection-title">Needs</div>
-            <div className="triple-grid">
-              {[0, 1, 2].map(i => (
-                <div className="field" key={i}>
-                  <label>Need {i + 1}</label>
-                  <input
-                    type="text"
-                    value={listing.needs[i] || ''}
-                    onChange={(e) => onUpdateNeed(i, e.target.value)}
-                    placeholder={`Need ${i + 1}`}
-                  />
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
+        </>
       )}
     </div>
   )
