@@ -15,6 +15,30 @@ const statusClass = (status) => {
 }
 const statusPillClass = (status) => status.replace(' ', '')
 
+// Format a 'YYYY-MM-DD' value as MM/DD/YYYY without timezone drift; '' if empty.
+const formatHeaderDate = (iso) => {
+  if (!iso) return ''
+  const parts = String(iso).split('-')
+  if (parts.length === 3) {
+    const [y, m, d] = parts
+    return `${m}/${d}/${y}`
+  }
+  const dt = new Date(iso)
+  if (isNaN(dt.getTime())) return ''
+  return `${String(dt.getMonth() + 1).padStart(2, '0')}/${String(dt.getDate()).padStart(2, '0')}/${dt.getFullYear()}`
+}
+
+// Sort by listingDate ascending (earliest first); entries without a date sink
+// to the bottom. listingDate is 'YYYY-MM-DD', so string compare is chronological.
+const byListingDateAsc = (a, b) => {
+  const da = a.listingDate || ''
+  const db = b.listingDate || ''
+  if (!da && !db) return 0
+  if (!da) return 1
+  if (!db) return -1
+  return da < db ? -1 : da > db ? 1 : 0
+}
+
 const makeId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
   return 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9)
@@ -32,7 +56,6 @@ const emptyListing = (overrides = {}) => ({
   photoDates: ['', '', ''],
   needs: ['', '', ''],
   sortOrder: 0,
-  collapsed: false,
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
   createdBy: null,
@@ -51,7 +74,6 @@ const rowToListing = (row) => ({
   photoDates: [row.photo_date_1 || '', row.photo_date_2 || '', row.photo_date_3 || ''],
   needs: [row.need_1 || '', row.need_2 || '', row.need_3 || ''],
   sortOrder: row.sort_order ?? 0,
-  collapsed: false,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
   createdBy: row.created_by,
@@ -136,6 +158,7 @@ function Tracker({ session, profile }) {
   const [loading, setLoading] = useState(true)
   const [view, setView] = useState('tracker') // 'tracker' | 'admin'
   const [statusMsg, setStatusMsg] = useState(null)
+  const [expandedId, setExpandedId] = useState(null) // accordion: only one open
   const fileInputRef = useRef(null)
   const saveTimers = useRef(new Map())
   const listingsRef = useRef(listings)
@@ -198,9 +221,10 @@ function Tracker({ session, profile }) {
     'All Active': listings.filter(l => l.status !== 'Completed').length,
   }
 
-  const visibleListings = activeTab === 'All Active'
+  const visibleListings = (activeTab === 'All Active'
     ? listings.filter(l => l.status !== 'Completed')
     : listings.filter(l => l.status === activeTab)
+  ).sort(byListingDateAsc)
 
   const scheduleSave = (id) => {
     if (saveTimers.current.has(id)) clearTimeout(saveTimers.current.get(id))
@@ -223,9 +247,7 @@ function Tracker({ session, profile }) {
 
   const updateListing = (id, updates) => {
     setListings(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l))
-    // collapsed is UI-only, never persisted
-    const onlyCollapsed = Object.keys(updates).length === 1 && 'collapsed' in updates
-    if (!onlyCollapsed) scheduleSave(id)
+    scheduleSave(id)
   }
 
   const updatePhotoDate = (id, idx, value) => {
@@ -249,13 +271,7 @@ function Tracker({ session, profile }) {
   }
 
   const addListing = async () => {
-    const minSort = listings.length > 0
-      ? Math.min(...listings.map(l => l.sortOrder ?? 0))
-      : 0
-    const fresh = emptyListing({
-      sortOrder: minSort - 1,
-      createdBy: session.user.id,
-    })
+    const fresh = emptyListing({ createdBy: session.user.id })
     const row = { ...listingToRow(fresh), created_by: session.user.id }
     const { data, error } = await supabase
       .from('listings')
@@ -266,8 +282,10 @@ function Tracker({ session, profile }) {
       setStatusMsg(`Could not create listing: ${error.message}`)
       return
     }
-    setListings(prev => [rowToListing(data), ...prev])
+    const created = rowToListing(data)
+    setListings(prev => [created, ...prev])
     setActiveTab('New')
+    setExpandedId(created.id) // open the new card (accordion)
   }
 
   const deleteListing = async (id) => {
@@ -336,34 +354,6 @@ function Tracker({ session, profile }) {
     }
     reader.readAsText(file)
     e.target.value = ''
-  }
-
-  const moveListing = async (id, direction) => {
-    const active = listings.filter(l => l.status !== 'Completed')
-    const idx = active.findIndex(l => l.id === id)
-    if (idx === -1) return
-    const swap = active[idx + direction]
-    if (!swap) return
-
-    const a = active[idx]
-    const b = swap
-    const aSort = a.sortOrder ?? 0
-    const bSort = b.sortOrder ?? 0
-
-    setListings(prev => prev.map(l => {
-      if (l.id === a.id) return { ...l, sortOrder: bSort }
-      if (l.id === b.id) return { ...l, sortOrder: aSort }
-      return l
-    }))
-
-    const [r1, r2] = await Promise.all([
-      supabase.from('listings').update({ sort_order: bSort }).eq('id', a.id),
-      supabase.from('listings').update({ sort_order: aSort }).eq('id', b.id),
-    ])
-    if (r1.error || r2.error) {
-      setStatusMsg('Reorder failed; refreshing.')
-      loadListings()
-    }
   }
 
   const signOut = async () => {
@@ -446,20 +436,17 @@ function Tracker({ session, profile }) {
             <p>Click "Add New Listing" to get started.</p>
           </div>
         ) : (
-          visibleListings.map((listing, idx) => (
+          visibleListings.map((listing) => (
             <ListingCard
               key={listing.id}
               listing={listing}
-              activeTab={activeTab}
-              isFirst={idx === 0}
-              isLast={idx === visibleListings.length - 1}
+              expanded={expandedId === listing.id}
               creatorEmail={profiles[listing.createdBy]}
+              onToggle={() => setExpandedId(prev => prev === listing.id ? null : listing.id)}
               onUpdate={(updates) => updateListing(listing.id, updates)}
               onUpdatePhotoDate={(i, v) => updatePhotoDate(listing.id, i, v)}
               onUpdateNeed={(i, v) => updateNeed(listing.id, i, v)}
               onDelete={() => setConfirmDelete(listing)}
-              onMoveUp={() => moveListing(listing.id, -1)}
-              onMoveDown={() => moveListing(listing.id, 1)}
             />
           ))
         )}
@@ -487,26 +474,27 @@ function Tracker({ session, profile }) {
 
 function ListingCard({
   listing,
-  activeTab,
-  isFirst,
-  isLast,
+  expanded,
   creatorEmail,
+  onToggle,
   onUpdate,
   onUpdatePhotoDate,
   onUpdateNeed,
   onDelete,
-  onMoveUp,
-  onMoveDown,
 }) {
-  const showReorder = activeTab === 'All Active'
-  const collapsed = !!listing.collapsed
   const createdLabel = listing.createdAt
     ? new Date(listing.createdAt).toLocaleDateString()
     : null
+  const headerDate = formatHeaderDate(listing.listingDate)
 
   return (
     <div className={`listing-card ${statusClass(listing.status)}`}>
-      <div className={`card-header ${collapsed ? 'no-border' : ''}`}>
+      <div
+        className={`card-header ${!expanded ? 'no-border' : ''}`}
+        onClick={onToggle}
+        style={{ cursor: 'pointer' }}
+        title={expanded ? 'Click to collapse' : 'Click to expand'}
+      >
         <div className="card-title">
           {listing.address
             ? listing.address
@@ -514,23 +502,22 @@ function ListingCard({
           {' '}
           <span className={`status-pill ${statusPillClass(listing.status)}`}>{listing.status}</span>
         </div>
+        {!expanded && headerDate && (
+          <span style={{ fontSize: '12px', color: 'var(--muted)', fontWeight: 500, whiteSpace: 'nowrap', marginRight: '4px' }}>
+            {headerDate}
+          </span>
+        )}
         <div className="card-controls">
-          {showReorder && (
-            <>
-              <button className="icon-btn" title="Move up" onClick={onMoveUp} disabled={isFirst}>↑</button>
-              <button className="icon-btn" title="Move down" onClick={onMoveDown} disabled={isLast}>↓</button>
-            </>
-          )}
+          <span className="icon-btn" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
           <button
-            className="icon-btn"
-            title={collapsed ? 'Expand' : 'Collapse'}
-            onClick={() => onUpdate({ collapsed: !collapsed })}
-          >{collapsed ? '▾' : '▴'}</button>
-          <button className="icon-btn danger" title="Delete" onClick={onDelete}>×</button>
+            className="icon-btn danger"
+            title="Delete"
+            onClick={(e) => { e.stopPropagation(); onDelete() }}
+          >×</button>
         </div>
       </div>
 
-      {!collapsed && (
+      {expanded && (
         <>
           {(creatorEmail || createdLabel) && (
             <div className="card-meta">
